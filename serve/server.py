@@ -2711,6 +2711,12 @@ class Service:
         the control tokens the template writes are control tokens."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
+        if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
+            # A template that opens the thinking block whatever it is told (glm5-next: its generation prompt is
+            # always `<|assistant|><think>`, it has no enable_thinking, and an effort it does not know means
+            # 'max'): thinking off closes the block empty, the form the same template writes for a past turn
+            # that did not think.
+            prompt += "</think>"
         if not changed:
             return self.tok.encode(prompt, parse_special=True)
         prompt, plain = unmark_think_literals(prompt, self.literals)
