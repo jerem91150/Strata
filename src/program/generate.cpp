@@ -28,6 +28,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/glm_gpu_experts.hpp"
 #include "strata/core/glm_layer.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
@@ -422,6 +423,7 @@ struct Options {
     bool no_host_worker = false;
     bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    int64_t glm_gpu_mib = -1;     ///< glm5-next: VRAM for routed experts (-1 off, 0 = what is free)
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
@@ -1982,6 +1984,7 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--glm-gpu-experts") o.glm_gpu_mib = std::atoll(next("--glm-gpu-experts"));
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
@@ -4397,6 +4400,7 @@ int main(int argc, char** argv) {
     // Leaving any of them to the user is how a GLM run would end up in `session_loop`, which does not know the
     // arch and would compute the first family's layers against GLM's weights.
     strata::core::GlmExpertPool glm_pool_store;
+    strata::core::GlmGpuExperts glm_gpu_store;
     strata::core::GlmPoolFn glm_pool_fn = nullptr;
     void* glm_pool_user = nullptr;
     if (g.arch == strata::core::Arch::Glm5Next) {
@@ -5224,6 +5228,28 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
+    if (g.arch == strata::core::Arch::Glm5Next && o.glm_gpu_mib >= 0) {
+        // The VRAM tier of the routed experts (glm_gpu_experts.hpp), sized LAST so the weights, the session and
+        // its scratch are already counted in what the card has free.  0 = all of it less a margin.
+        const auto& glay = strata::kernels::cpu::expert_layout();
+        std::vector<int> gu((size_t) g.n_layers, -1), dt((size_t) g.n_layers, -1);
+        std::vector<uint64_t> bb((size_t) g.n_layers, 0);
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (g.is_dense_ffn_layer(l) || (size_t) l >= glay.fmt.size()) continue;
+            gu[(size_t) l] = glay.fmt[(size_t) l].gu_type;
+            dt[(size_t) l] = glay.fmt[(size_t) l].d_type;
+            bb[(size_t) l] = glay.blob_bytes(l);
+        }
+        const char* rv = std::getenv("STRATA_GLM_GPU_RESERVE_MIB");
+        const int64_t reserve = (int64_t) (rv ? std::atoll(rv) : 2048) << 20;
+        const int64_t avail = (int64_t) strata::core::device_free_bytes() - reserve;
+        const int64_t budget = o.glm_gpu_mib > 0 ? std::min<int64_t>(o.glm_gpu_mib << 20, avail) : avail;
+        if (!glm_gpu_store.init(srcp, gu, dt, bb, g.n_expert, K, g.n_embd, g.n_ff, budget, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        ss.glm_gpu = &glm_gpu_store;
+    }
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         // glm5-next collapses the hyper-connection stack with the MEAN and a plain `output_norm`; the first

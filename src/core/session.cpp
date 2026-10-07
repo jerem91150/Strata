@@ -4,6 +4,8 @@
 #include "strata/core/progress.hpp"
 
 #include "strata/core/glm_layer.hpp"
+#include <cmath>
+#include "strata/core/glm_gpu_experts.hpp"
 
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -849,6 +851,54 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     return true;
 }
 
+namespace {
+// glm5-next, one decode token, one MoE layer, with the VRAM tier (see glm_gpu_experts.hpp).  `x` and `ids` are
+// already on the host (the caller synchronized); `parts` is the device's k x n_embd unweighted rows.
+bool glm_gpu_layer(SessionState& s, int64_t l, std::vector<float>& x, std::vector<int32_t>& ids,
+                   std::vector<float>& out, float* parts, void* stream, GlmPoolFn pool, void* user,
+                   std::string& err) {
+    static const bool check = [] { const char* v = std::getenv("STRATA_GLM_GPU_CHECK"); return v && v[0] == '1'; }();
+    static thread_local std::vector<int32_t> miss, sub;
+    cudaStream_t cs = (cudaStream_t) stream;
+    const int64_t n = (int64_t) x.size();
+    if (!s.glm_gpu->run_hits(l, s.glm.cur, ids.data(), parts, stream, miss, err)) return false;
+    if (!miss.empty()) {
+        sub.resize(miss.size());
+        for (size_t j = 0; j < miss.size(); ++j) sub[j] = ids[(size_t) miss[j]];
+        if (!pool(user, l, x.data(), sub.data(), 1, (int64_t) sub.size(), out.data(), err)) return false;
+        for (size_t j = 0; j < miss.size(); ++j) {
+            if (cudaMemcpyAsync(parts + (size_t) miss[j] * (size_t) n, out.data() + j * (size_t) n,
+                                (size_t) n * sizeof(float), cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+                err = std::string("staging the expert results: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+        if (!s.glm_gpu->admit(l, ids.data(), miss, stream, err)) return false;
+    }
+    if (check && !s.glm_gpu->last_hits().empty()) {
+        // The hits again, on the CPU, against what the card wrote.
+        const auto& hp = s.glm_gpu->last_hits();
+        std::vector<int32_t> hid(hp.size());
+        for (size_t j = 0; j < hp.size(); ++j) hid[j] = ids[(size_t) hp[j]];
+        std::vector<float> cpu(hp.size() * (size_t) n), gpu((size_t) n);
+        if (!pool(user, l, x.data(), hid.data(), 1, (int64_t) hid.size(), cpu.data(), err)) return false;
+        double worst = 0.0, scale = 0.0;
+        for (size_t j = 0; j < hp.size(); ++j) {
+            cudaMemcpyAsync(gpu.data(), parts + (size_t) hp[j] * (size_t) n, (size_t) n * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+            cudaStreamSynchronize(cs);
+            for (int64_t c = 0; c < n; ++c) {
+                worst = std::max(worst, (double) std::fabs(gpu[(size_t) c] - cpu[j * (size_t) n + (size_t) c]));
+                scale = std::max(scale, (double) std::fabs(cpu[j * (size_t) n + (size_t) c]));
+            }
+        }
+        std::fprintf(stderr, "strata glm gpu check: layer %lld, %zu hits, max |gpu - cpu| %.3e (max |cpu| %.3e)\n",
+                     (long long) l, hp.size(), worst, scale);
+    }
+    return true;
+}
+}  // namespace
+
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                    SessionState& s, const float* parts, void* stream, bool sync_every_layer,
                    GlmPoolFn glm_pool, void* glm_pool_user, std::string& err) {
@@ -937,6 +987,15 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
                     err = "layer " + std::to_string(l) + ": waiting for the expert handoff";
                     return false;
                 }
+                if (s.glm_gpu != nullptr) {
+                    // THE VRAM TIER: the hits are launched first and run on the card while the CPU pool computes
+                    // the misses; only the misses' rows cross PCIe, each into its own row of `parts`.
+                    if (!glm_gpu_layer(s, l, glm_x_host, glm_ids_host, glm_out_host, const_cast<float*>(parts),
+                                       stream, glm_pool, glm_pool_user, err)) {
+                        err = "layer " + std::to_string(l) + ": " + err;
+                        return false;
+                    }
+                } else {
                 if (!glm_pool(glm_pool_user, l, glm_x_host.data(), glm_ids_host.data(), 1, k, glm_out_host.data(),
                               err)) {
                     err = "layer " + std::to_string(l) + ": " + err;
@@ -949,6 +1008,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
                     err = "layer " + std::to_string(l) + ": staging the expert results: " +
                           cudaGetErrorString(cudaGetLastError());
                     return false;
+                }
                 }
             }
             if (!glm_block_layer_post(tables, g, l, k, s.glm, s.moe, s.block, parts, stream, err)) {
