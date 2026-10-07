@@ -30,5 +30,27 @@ not affected because setup passes `"gpu": 1`.
 
 ## End to end
 
-In progress: Unsloth UD-IQ2_XXS (4 shards, 101.8 GB) on 24 GB VRAM + 64 GB RAM, against llama.cpp Vulkan on the same
-machine with the same prompts. Numbers will go here.
+Unsloth UD-IQ2_XXS (4 shards, 101.8 GB) on 24 GB VRAM + 64 GB RAM. The expert set is 92 GiB, so it does not fit
+in RAM: the engine runs with `--mmap-experts`, and `--prefill 1` because the chunked prompt read needs sliceable
+experts and this file's IQ2_XXS gate/up are not.
+
+Two things this branch adds on top of the PR:
+
+- `--glm-gpu-experts 0`: a per-layer set of experts in VRAM, computed on the card, the CPU pool only gets the
+  misses. Slots fill as experts are routed, then LFU decides who stays.
+- thinking off now works for GLM. Its template always opens `<think>` and maps unknown efforts to `max`, so
+  `reasoning_effort: "none"` used to think at full length.
+
+Decode, 256 tokens, same prompt five times in a row:
+
+| | tok/s |
+|---|---|
+| llama.cpp Vulkan, 5 layers of experts on the card (`-ncmoe 40`) | 4.2 to 4.7 |
+| this PR, experts on the CPU | 2.5 |
+| `--glm-gpu-experts 0` (13.8 GiB, 46 slots a layer) | 2.9, 4.1, 5.9, 4.8, 5.3 |
+
+About 71% of the routed experts are hits once warm. `STRATA_GLM_GPU_CHECK=1` recomputes every hit on the CPU:
+the gap is about 2% of the largest value, from the activation rounding (q8_1 on the card, q8_K on the CPU).
+
+Prompt reading is the weak spot: about 2.4 tok/s token by token, against 3.8 for llama.cpp. A chunked read
+with the experts streamed to the card is the next thing to do.
