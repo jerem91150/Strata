@@ -1,0 +1,15 @@
+# My contributions to Strata and Project Maya
+
+I run both engines on one machine (Windows 11, RX 7900 XTX 24 GB, 64 GB RAM): Strata for Qwen, Project Maya for GLM-5.3-Flash. A lot of what I did moved between the two, so I keep the list here in one place, with what was picked up upstream.
+
+## Strata (Niko1221/Strata)
+
+- **2026-10-07, VRAM expert tier for GLM-5.3 (`--glm-gpu-experts`).** On the GLM PR (#1315) the routed experts all ran on the CPU. I added an LFU tier that keeps the most used experts on the card: [1f0cc02](https://github.com/jerem91150/Strata/commit/1f0cc0277a38fccbcf4b9dff63be8cd63811da3f) on my branch `glm53-hip`, up to 5.9 tok/s decode on the 7900 XTX. Taken into the PR as [0b8303ee](https://github.com/Niko1221/Strata/commit/0b8303ee273af41889b880e287a878e4f7afa561), credited there. Numbers and notes: [comment 1](https://github.com/Niko1221/Strata/pull/1315#issuecomment-6039724632), [comment 2](https://github.com/Niko1221/Strata/pull/1315#issuecomment-6041887143).
+- **2026-10-09, GLM on Strata vs Maya, same machine.** [Comment on #1315](https://github.com/Niko1221/Strata/pull/1315#issuecomment-6079895325) with what I learned on Maya that applies to the PR (numbers in long prompts, disk reads on Windows).
+- **2026-10-09, fixed expert cache on Windows.** With other programs holding VRAM, a fixed `--expert-cache` made 0.1.40.2 three times slower and 0.1.41 crash; `auto` fixes both and is faster. [Issue #1706](https://github.com/Niko1221/Strata/issues/1706).
+
+## Project Maya (mw00/project-maya)
+
+- **2026-10-08, first native Windows + AMD run, and a sampling bug.** Answers lost the prompt after their first token on Windows/HIP. I tracked it down to the sampled token being drawn on the legacy stream (a device-wide sync between tokens). [Report in #6](https://github.com/mw00/project-maya/issues/6#issuecomment-6059465962). Fixed in v1.0.15 as [e3965e2](https://github.com/mw00/project-maya/commit/e3965e2faec6c414a38b93a1926f1cf8b8816abc), credited in the [release notes](https://github.com/mw00/project-maya/releases/tag/v1.0.15).
+- **2026-10-09, Windows HIP build.** Build script (adapted from Strata's), compat names, the hipBLASLt 100500 table for gfx1100, a thinking-off fix and a higher disk queue depth (1.66 to 4.27 GB/s on Windows). [PR #54](https://github.com/mw00/project-maya/pull/54).
+- **2026-10-09, intermittent engine crash on Windows.** Ruled out RAM, the prefill budget and my own disk change with an 8-session A/B run. [Issue #53](https://github.com/mw00/project-maya/issues/53), follow-up in [#6](https://github.com/mw00/project-maya/issues/6#issuecomment-6081287541).
